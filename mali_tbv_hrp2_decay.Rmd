@@ -1,0 +1,195 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Monophasic and Biphasic Exponential Decay Model Fitting for HRP2
+This code was adapted from Ruiyun Li at Imperial College to model HRP2 dynamics
+posttreatment in our 'NIH_clinical' dataset. 
+Note: Run 'mali_tbv_clinical.Rmd' first to read in and clean data
+Emily Reichert (PATH), July 2019
+
+```{r}
+#load required packages
+library("foreign")
+library("lme4")
+library("nlme")
+library("arm")
+
+#Note: first run Mali Clinical Analysis script to clean NIH_Clinical dataset
+
+#Restrict dataset to those within 35 days posttreatment with no recurrent Pf infection
+NIH_lme <- NIH_clinical %>%
+  select(`Volunteer ID`, HRP2_pg_ml, time_from_drug, parasites_uL) %>%
+  filter(time_from_drug > 0 & time_from_drug <= 35) %>%
+  mutate(recurrence = ifelse((time_from_drug > 1 & parasites_uL != 0), 1,0)) %>%
+  filter(recurrence != 1) %>%
+  select(`Volunteer ID`, HRP2_pg_ml, time_from_drug) %>%
+  drop_na()
+  
+colnames(NIH_lme) <- c("individual_lme", "HRP2_lme", "Time_lme") #volunteer ID, HRP2, and time post-treatment
+
+## fitting using HRP2 from 35 days after treatment
+NIH_lme35 <- subset(NIH_lme, Time_lme <= 35 & Time_lme>=0)
+
+individual_lme <- NIH_lme35[,1]
+HRP2_lme <- NIH_lme35[,2]
+Time_lme <- NIH_lme35[,3]
+
+##--- monophasic exp decay ---##
+
+#fit monophasic model w/ individual level random effect
+lmefit_NIH_lme35 <- lmer(log10(HRP2_lme) ~ Time_lme + (1|individual_lme), REML = F, data = NIH_lme35)
+
+coef(lmefit_NIH_lme35) # coef = fixef + ranef
+fixef(lmefit_NIH_lme35) # paras estimated over time -> the estimated regression line for all individuals
+ranef(lmefit_NIH_lme35) # indi-level errors, i.e. how much the intercept (initial HRP2 rate) for each individual varies from avg
+
+# predict the average value over all days using lmer() fitted paras
+days <- seq(0, 35, 1)
+lmepred_NIH_lme35_pop <- fixef(lmefit_NIH_lme35)["(Intercept)"] + fixef(lmefit_NIH_lme35)["Time_lme"] * days
+
+# predict inds value for each day using lmer() fitted paras
+lmepred_NIH_lme35_inds <- matrix(NA, nrow=length(unique(NIH_lme35$individual_lme)), ncol=length(days))
+for(i in 1:length(unique(NIH_lme35$individual_lme))){
+  lmepred_NIH_lme35_inds[i, ] <- coef(lmefit_NIH_lme35)$individual_lme[i,1] + coef(lmefit_NIH_lme35)$individual_lme[i,2] * days
+}
+
+# plot on log10-scale
+plot(days, lmepred_NIH_lme35_pop, tck=.01, type="l", ylab=expression(bold(log10r[HRP2])), ylim = c(0,4), lwd=2, font=2, font.lab=2)
+for(i in 1:length(unique(NIH_lme35$individual_lme))){
+  lines(days, lmepred_NIH_lme35_inds[i, ], col="deeppink")
+}
+points(NIH_lme35$Time_lme, log10(NIH_lme35$HRP2_lme), pch=20)
+lines(days, lmepred_NIH_lme35_pop, lwd=3)
+
+# plot on normal-scale
+plot(days, 10^(lmepred_NIH_lme35_pop), tck=.01, type="l", 
+     ylab=expression(bold(r[HRP2])), ylim = c(0,1000),lwd=2, font=2, font.lab=2, cex.axis=1.3,cex.lab=1.4, bty="n", tck=-.01)
+for(i in 1:length(unique(NIH_lme35$individual_lme))){
+  lines(days, 10^(lmepred_NIH_lme35_inds[i, ]), col="deeppink")
+}
+points(NIH_lme35$Time_lme, NIH_lme35$HRP2_lme, pch=20, col="deeppink")
+lines(days, 10^(lmepred_NIH_lme35_pop), lwd=3)
+
+
+##--- biphasic exp decay ---##
+
+#test for optimal switch point posttreatment, minimizing AIC and BIC
+aic_values <- rep(NA, 35)
+bic_values <- rep(NA, 35)
+for(i in 1:35){
+  switch_time <- i
+  lmefit_biphase_NIH_lme35 <- lmer(log10(HRP2_lme) ~ Time_lme + ifelse(Time_lme <= (switch_time), 0, Time_lme-(switch_time)) + (1|individual_lme), REML = F, data = NIH_lme35)
+  aic_values[i] <- AIC(lmefit_biphase_NIH_lme35)
+  bic_values[i] <- BIC(lmefit_biphase_NIH_lme35)
+}
+
+# AIC smallest for day 2-4, will use day 3 as switchpoint
+switch_time <- 3
+lmefit_biphase_NIH_lme35 <- lmer(log10(HRP2_lme) ~ Time_lme + ifelse(Time_lme <= (switch_time), 0, Time_lme-(switch_time)) + (1|individual_lme), REML = F, data = NIH_lme35)
+
+coef(lmefit_biphase_NIH_lme35) 
+fixef(lmefit_biphase_NIH_lme35)
+decay2 = fixef(lmefit_biphase_NIH_lme35)[3] + fixef(lmefit_biphase_NIH_lme35)[2]
+ranef(lmefit_biphase_NIH_lme35) 
+
+# Using simulate to estimte the posterior distribution of intercept and slopes
+lmefit_biphase_NIH_lme35_sim <- sim(lmefit_biphase_NIH_lme35, n.sim = 10000)
+par(mfrow=c(2,2))
+plot(density(fixef(lmefit_biphase_NIH_lme35_sim)[,1]), type="l", tck=.01, xlab="Intercept \n (Initial log10(HRP2)", ylab="Density", lwd=2, main=NA, font=2, font.lab=2)
+plot(density(fixef(lmefit_biphase_NIH_lme35_sim)[,2]), type="l", tck=.01, xlab="Decay rate 1", ylab="Density", lwd=2, main=NA, font=2, font.lab=2)
+plot(density(fixef(lmefit_biphase_NIH_lme35_sim)[,3] + -0.2563550), type="l", tck=.01, xlab="Decay rate 2", ylab="Density", lwd=2, main=NA, font=2, font.lab=2)
+
+# 95% CI of paras based on sim()
+lmefit_biphase_NIH_lme35_sim_interceptCI <- as.numeric(quantile(fixef(lmefit_biphase_NIH_lme35_sim)[,1], c(.025, .975)))
+lmefit_biphase_NIH_lme35_sim_solpe1CI <- as.numeric(quantile(fixef(lmefit_biphase_NIH_lme35_sim)[,2], c(.025, .975)))
+lmefit_biphase_NIH_lme35_sim_slope2CI <- as.numeric(quantile((fixef(lmefit_biphase_NIH_lme35_sim)[,3] + -0.2563550), c(.025, .975)))
+
+# predict the average value over all posttreatment days using lmer() fitted paras
+lmepred_biphase_NIH_lme35_pop <- fixef(lmefit_biphase_NIH_lme35)["(Intercept)"] + fixef(lmefit_biphase_NIH_lme35)["Time_lme"] * days +
+  fixef(lmefit_biphase_NIH_lme35)[3] * ifelse(days <= (switch_time), 0, days- switch_time)
+
+# predict inds value for each day using lmer() fitted paras
+lmepred_biphase_NIH_lme35_inds <- matrix(NA, nrow=length(unique(NIH_lme35$individual_lme)), ncol=length(days))
+for(i in 1:length(unique(NIH_lme35$individual_lme))){
+  lmepred_biphase_NIH_lme35_inds[i, ] <- coef(lmefit_biphase_NIH_lme35)$individual_lme[i,1] + coef(lmefit_biphase_NIH_lme35)$individual_lme[i,2] * days +
+    coef(lmefit_biphase_NIH_lme35)$individual_lme[i,3] * ifelse(days <= (switch_time), 0, days-(switch_time))
+}
+
+# plot on log10-scale
+plot.new()
+par(mfrow=c(1,1))
+plot(days, lmepred_biphase_NIH_lme35_pop, tck=.01, type="l", ylim=range(c(log10(HRP2_lme), lmepred_biphase_NIH_lme35_pop, lmepred_biphase_NIH_lme35_inds)), ylab="log10(HRP2 after Anti-Malarial Treatment)", lwd=2, font=2, font.lab=2)
+for(i in 1:length(unique(NIH_lme35$individual_lme))){
+  lines(days, lmepred_biphase_NIH_lme35_inds[i, ], col="pink")
+}
+points(NIH_lme35$Time_lme, log10(NIH_lme35$HRP2_lme), pch=20)
+lines(days, lmepred_biphase_NIH_lme35_pop, lwd=3)
+
+# plot on normal-scale
+plot(days, 10^(lmepred_biphase_NIH_lme35_pop), tck=.01, type="l", 
+     ylab=expression(bold(r[HRP2])), lwd=2, font=2, font.lab=2, cex.axis=1.3,cex.lab=1.4, bty="n", tck=-.01)
+for(i in 1:length(unique(NIH_lme35$individual_lme))){
+  lines(days, 10^(lmepred_biphase_NIH_lme35_inds[i, ]), col="pink")
+}
+points(NIH_lme35$Time_lme, NIH_lme35$HRP2_lme, pch=20, col="black")
+lines(days, 10^(lmepred_biphase_NIH_lme35_pop), lwd=3)
+
+# predict 95%CI of log10(HRP2) using sim() at each day posttreatment
+lmepred_biphase_NIH_lme35_pop_lwr = lmepred_biphase_NIH_lme35_pop_upr <- c()
+lmepred_biphase_NIH_lme35_pop_lwr <- lmefit_biphase_NIH_lme35_sim_interceptCI[1] + lmefit_biphase_NIH_lme35_sim_solpe1CI[1] * days +
+  lmefit_biphase_NIH_lme35_sim_slope2CI[1] * ifelse(days <= switch_time, 0, days - switch_time)
+lmepred_biphase_NIH_lme35_pop_upr <- lmefit_biphase_NIH_lme35_sim_interceptCI[2] + lmefit_biphase_NIH_lme35_sim_solpe1CI[2] * days +
+  lmefit_biphase_NIH_lme35_sim_slope2CI[2] * ifelse(days <= switch_time, 0, days - switch_time)
+
+# mean, median and 95%CI of obs HRP2 over for each day posttreatment
+HRP2rate_median_overday_NIH_lme35 = HRP2rate_mean_overday_NIH_lme35 = 
+  HRP2rate_95CIlw_overday_NIH_lme35 = HRP2rate_95CIup_overday_NIH_lme35 <- c()
+for(a in 1:length(unique(NIH_lme35$Time_lme))){
+  HRP2rate_median_overday_NIH_lme35[a] <- median(log10(NIH_lme35$HRP2_lme[NIH_lme35$Time_lme == unique(NIH_lme35$Time_lme)[a]]))
+  HRP2rate_mean_overday_NIH_lme35[a] <- mean(log10(NIH_lme35$HRP2_lme[NIH_lme35$Time_lme == unique(NIH_lme35$Time_lme)[a]]))
+  HRP2rate_95CIlw_overday_NIH_lme35[a] <- quantile(log10(NIH_lme35$HRP2_lme[NIH_lme35$Time_lme == unique(NIH_lme35$Time_lme)[a]]), .025)
+  HRP2rate_95CIup_overday_NIH_lme35[a] <- quantile(log10(NIH_lme35$HRP2_lme[NIH_lme35$Time_lme == unique(NIH_lme35$Time_lme)[a]]), .975)
+}
+
+contest1D(lmefit_biphase_NIH_lme35, c(1,0,0), confint=TRUE)
+contest1D(lmefit_biphase_NIH_lme35, c(0,1,0), confint=TRUE)
+contest1D(lmefit_biphase_NIH_lme35, c(0,0,1), confint=TRUE)
+```
+
+
+```{r}
+library(merTools)
+#Prediction Intervals (95%)
+set.seed(8111)
+participants <- NIH_lme35$individual_lme[1:36]
+hrp2_PI <- predictInterval(merMod = lmefit_biphase_NIH_lme35, newdata = data.frame(Time_lme = c(1:36), individual_lme = rep(1, 36)), level = 0.95, n.sims = 1000, stat = "median")
+```
+
+```{r}
+#Generate final figure (Figure 5A) for HRP2 biphasic decay median model predictions and associated 95% PI
+pdf(file = "hrp2_decay.pdf", width = 8, height = 6)
+
+ggplot() + xlab("Days Posttreatment") +  ylab("HRP2 (pg/ml)") + geom_ribbon(data = hrp2_PI, aes(ymin = lwr, ymax = upr, x = c(seq(0,35))), fill = "deeppink", alpha = 0.1) + geom_point(aes(x = days, y = lmepred_biphase_NIH_lme35_pop), size = 2, col = "black") + geom_point(aes(x = unique(NIH_lme35$Time_lme), HRP2rate_median_overday_NIH_lme35), size = 1, col = "black") + geom_segment(aes(x = unique(NIH_lme35$Time_lme) + .5, y = HRP2rate_95CIlw_overday_NIH_lme35,
+         xend = unique(NIH_lme35$Time_lme) - 0.5, yend = HRP2rate_95CIlw_overday_NIH_lme35), col = "deeppink") + geom_segment(aes(x = unique(NIH_lme35$Time_lme)+.5, y = HRP2rate_95CIup_overday_NIH_lme35,
+         xend = unique(NIH_lme35$Time_lme)-.5, yend = HRP2rate_95CIup_overday_NIH_lme35), col = "deeppink") + geom_segment(aes(x = unique(NIH_lme35$Time_lme), y = HRP2rate_95CIlw_overday_NIH_lme35,
+         xend = unique(NIH_lme35$Time_lme), yend = HRP2rate_95CIup_overday_NIH_lme35), col = "deeppink") + theme_light(base_size = 18) + geom_line(aes(x = days, y = lmepred_biphase_NIH_lme35_pop), col = "black") + scale_y_continuous(breaks = c(0,1,2,3,4,5), labels = c(1, 10, 100, '1,000', '10,000', 10^5)) + scale_x_continuous(breaks = c(seq(0,35,5)), limits = c(-0.5,35.5), expand = c(0,0)) + geom_line(aes(x = days, y = log10(2.3)), col = "gray", lty = 2)
+
+dev.off()
+```
+
+```{r}
+#P value for improvement to model by biphasic vs monophasic
+#by ANOVA
+anova(lmefit_biphase_NIH_lme35, lmefit_NIH_lme35, test="Chisq")
+summary(lmefit_biphase_NIH_lme35)
+```
+
+
+
+
+
+
+
+

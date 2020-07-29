@@ -1,0 +1,191 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Monophasic and Biphasic Exponential Decay Model Fitting for pLDH
+This code was adapted from Ruiyun Li at Imperial College to model pLDH dynamics
+posttreatment in our 'NIH_clinical' dataset. 
+Note: Run 'mali_tbv_clinical.Rmd' first to read in and clean data
+Emily Reichert (PATH), July 2019
+
+```{r}
+#load necessary packages
+library("foreign")
+library("lme4")
+library("nlme")
+library("arm")
+
+#restrict dataset to those within 8 days posttreatment with no recurrent PF
+NIH_lme8 <- NIH_clinical %>%
+  select(`Volunteer ID`, LDH_Pan_pg_ml, time_from_drug, parasites_uL) %>%
+  filter(time_from_drug > 0 & time_from_drug <= 8) %>%
+  mutate(recurrence = ifelse((time_from_drug > 1 & parasites_uL != 0), 1,0)) %>%
+  filter(recurrence != 1) %>%
+  select(`Volunteer ID`, LDH_Pan_pg_ml, time_from_drug) %>%
+  drop_na()
+
+colnames(NIH_lme8) <- c("individual_lme", "LDH_lme", "Time_lme") #volunteer ID, LDH, and time post-treatment
+
+## fitting using LDH from 8 days after treatment
+NIH_lme8 <- subset(NIH_lme8, Time_lme >= 0 & Time_lme <= 8)
+
+individual_lme <- NIH_lme8[,1]
+LDH_lme <- NIH_lme8[,2]
+Time_lme <- NIH_lme8[,3]
+days <- seq(0, 8, 1)
+
+##--- monophasic exp decay ---##
+
+#single phase exponential decay with individual level random effect
+lmefit_NIH_lme8 <- lmer(log10(LDH_lme) ~ Time_lme + (1|individual_lme), data = NIH_lme8)
+coef(lmefit_NIH_lme8) # coef = fixef + ranef
+fixef(lmefit_NIH_lme8) # paras estimated over years -> the estimated regression line for all individuals
+ranef(lmefit_NIH_lme8) # indi-level errors, i.e. how much the intercept (initial LDH rate) for each individual varies from avg
+
+# predict the average value over all days using lmer() fitted paras
+days <- seq(0,8,1)
+lmepred_NIH_lme8_pop <- fixef(lmefit_NIH_lme8)["(Intercept)"] + fixef(lmefit_NIH_lme8)["Time_lme"] * days
+
+# predict inds value for each day posttreatment using lmer() fitted paras
+lmepred_NIH_lme8_inds <- matrix(NA, nrow=length(unique(NIH_lme8$individual_lme)), ncol=length(days))
+for(i in 1:length(unique(NIH_lme8$individual_lme))){
+  lmepred_NIH_lme8_inds[i, ] <- coef(lmefit_NIH_lme8)$individual_lme[i,1] + coef(lmefit_NIH_lme8)$individual_lme[i,2] * days
+}
+
+# plot on log10-scale
+plot(days, lmepred_NIH_lme8_pop, tck=.01, type="l", ylab=expression(bold(log10r[LDH])), ylim = c(0,4), lwd=2, font=2, font.lab=2)
+for(i in 1:length(unique(NIH_lme8$individual_lme))){
+  lines(days, lmepred_NIH_lme8_inds[i, ], col="deepskyblue3")
+}
+points(NIH_lme8$Time_lme, log10(NIH_lme8$LDH_lme), pch=20)
+lines(days, lmepred_NIH_lme8_pop, lwd=3)
+
+# plot on normal-scale
+plot(days, 10^(lmepred_NIH_lme8_pop), tck=.01, type="l", 
+     ylab=expression(bold(r[LDH])), ylim = c(0,1000),lwd=2, font=2, font.lab=2, cex.axis=1.3,cex.lab=1.4, bty="n", tck=-.01)
+for(i in 1:length(unique(NIH_lme8$individual_lme))){
+  lines(days, 10^(lmepred_NIH_lme8_inds[i, ]), col="deepskyblue3")
+}
+points(NIH_lme8$Time_lme, NIH_lme8$LDH_lme, pch=20, col="deepskyblue3")
+lines(days, 10^(lmepred_NIH_lme8_pop), lwd=3)
+
+##--- biphasic exp decay ---##
+## NB:
+# the changing piont (knot) is set to 2 days,
+# with the assumption that there is a significantly different decay rate of LDH for recent treatment vs. not
+
+#find optimal switchpoint that minimizes AIC
+aic_values <- rep(NA, 8)
+for(i in 1:8){
+  switch_time <- i
+  lmefit_biphase_NIH_lme8 <- lmer(log10(LDH_lme) ~ Time_lme + ifelse(Time_lme <= (switch_time), 0, Time_lme-(switch_time)) + (1|individual_lme), data = NIH_lme8)
+  aic_values[i] <- AIC(lmefit_biphase_NIH_lme8)
+}
+
+#set switchpoint to 2 days posttreatment
+switch_time = 2
+
+#fit biphasic decay model
+lmefit_biphase_NIH_lme8 <- lmer(log10(LDH_lme) ~ Time_lme + ifelse(Time_lme <= (switch_time), 0, Time_lme-(switch_time)) + (1|individual_lme), data = NIH_lme8)
+
+coef(lmefit_biphase_NIH_lme8) 
+fixef(lmefit_biphase_NIH_lme8) 
+ranef(lmefit_biphase_NIH_lme8) 
+
+# Using simulate to estimate the posterior distribution of intercept and slopes
+set.seed(1212)
+lmefit_biphase_NIH_lme8_sim <- sim(lmefit_biphase_NIH_lme8, n.sim = 10000)
+par(mfrow=c(2,2))
+plot(density(fixef(lmefit_biphase_NIH_lme8_sim)[,1]), type="l", tck=.01, xlab="Intercept \n (Initial log10(LDH)", ylab="Density", lwd=2, main=NA, font=2, font.lab=2)
+plot(density(fixef(lmefit_biphase_NIH_lme8_sim)[,2]), type="l", tck=.01, xlab="Decay rate 1", ylab="Density", lwd=2, main=NA, font=2, font.lab=2)
+plot(density(fixef(lmefit_biphase_NIH_lme8_sim)[,3] + -.6021286), type="l", tck=.01, xlab="Decay rate 2", ylab="Density", lwd=2, main=NA, font=2, font.lab=2)
+
+# 95% CI of paras based on sim()
+lmefit_biphase_NIH_lme8_sim_interceptCI <- as.numeric(quantile(fixef(lmefit_biphase_NIH_lme8_sim)[,1], c(.025, .975)))
+lmefit_biphase_NIH_lme8_sim_solpe1CI <- as.numeric(quantile(fixef(lmefit_biphase_NIH_lme8_sim)[,2], c(.025, .975)))
+lmefit_biphase_NIH_lme8_sim_slope2CI <- as.numeric(quantile(fixef(lmefit_biphase_NIH_lme8_sim)[,3], c(.025, .975)))
+
+# predict the average value over all days using lmer() fitted paras
+lmepred_biphase_NIH_lme8_pop <- fixef(lmefit_biphase_NIH_lme8)["(Intercept)"] + fixef(lmefit_biphase_NIH_lme8)["Time_lme"] * days +
+  (fixef(lmefit_biphase_NIH_lme8)[3]) * ifelse(days <= (switch_time), 0, days- switch_time)
+
+
+# predict inds value for each year using lmer() fitted paras
+lmepred_biphase_NIH_lme8_inds <- matrix(NA, nrow=length(unique(NIH_lme8$individual_lme)), ncol=length(days))
+for(i in 1:length(unique(NIH_lme8$individual_lme))){
+  lmepred_biphase_NIH_lme8_inds[i,] <- coef(lmefit_biphase_NIH_lme8)$individual_lme[i,1] + coef(lmefit_biphase_NIH_lme8)$individual_lme[i,2] * days +
+    (coef(lmefit_biphase_NIH_lme8)$individual_lme[i,3]) * ifelse(days <= (switch_time), 0, days-(switch_time))
+}
+
+# plot on log10-scale
+plot.new()
+par(mfrow=c(1,1))
+plot(days, lmepred_biphase_NIH_lme8_pop, tck=.01, type="l", ylim=range(c(log10(LDH_lme), lmepred_biphase_NIH_lme8_pop, lmepred_biphase_NIH_lme8_inds)), ylab="log10(LDH after Anti-Malarial Treatment)", lwd=2, font=2, font.lab=2)
+for(i in 1:length(unique(NIH_lme8$individual_lme))){
+  lines(days, lmepred_biphase_NIH_lme8_inds[i, ], col="deepskyblue3")
+}
+points(NIH_lme8$Time_lme, log10(NIH_lme8$LDH_lme), pch=20)
+lines(days, lmepred_biphase_NIH_lme8_pop, lwd=3)
+
+# plot on normal-scale
+plot(days, 10^(lmepred_biphase_NIH_lme8_pop), tck=.01, type="l", 
+     ylab=expression(bold(r[LDH])), lwd=2, font=2, font.lab=2, cex.axis=1.3,cex.lab=1.4, bty="n", tck=-.01)
+for(i in 1:length(unique(NIH_lme8$individual_lme))){
+  lines(days, 10^(lmepred_biphase_NIH_lme8_inds[i, ]), col="deepskyblue3")
+}
+points(NIH_lme8$Time_lme, NIH_lme8$LDH_lme, pch=20, col="black")
+lines(days, 10^(lmepred_biphase_NIH_lme8_pop), lwd=3)
+
+
+# predict 95%CI of log10(LDH) using sim() at each day posttreatment
+lmepred_biphase_NIH_lme8_pop_lwr = lmepred_biphase_NIH_lme8_pop_upr <- c()
+lmepred_biphase_NIH_lme8_pop_lwr <- lmefit_biphase_NIH_lme8_sim_interceptCI[1] + lmefit_biphase_NIH_lme8_sim_solpe1CI[1] * days +
+  (lmefit_biphase_NIH_lme8_sim_slope2CI[1] * ifelse(days <= (switch_time), 0, days - switch_time))
+
+lmepred_biphase_NIH_lme8_pop_upr <- lmefit_biphase_NIH_lme8_sim_interceptCI[2] + lmefit_biphase_NIH_lme8_sim_solpe1CI[2] * days +
+  lmefit_biphase_NIH_lme8_sim_slope2CI[2] * ifelse(days <= (switch_time), 0, days - switch_time)
+
+# mean, median and 95%CI of obs LDH for each day posttreatment
+LDHrate_median_overday_NIH_lme8 = LDHrate_mean_overday_NIH_lme8 = 
+  LDHrate_95CIlw_overday_NIH_lme8 = LDHrate_95CIup_overday_NIH_lme8 <- c()
+for(a in 1:length(unique(NIH_lme8$Time_lme))){
+  LDHrate_median_overday_NIH_lme8[a] <- median(log10(NIH_lme8$LDH_lme[NIH_lme8$Time_lme == unique(NIH_lme8$Time_lme)[a]]))
+  LDHrate_mean_overday_NIH_lme8[a] <- mean(log10(NIH_lme8$LDH_lme[NIH_lme8$Time_lme == unique(NIH_lme8$Time_lme)[a]]))
+  LDHrate_95CIlw_overday_NIH_lme8[a] <- quantile(log10(NIH_lme8$LDH_lme[NIH_lme8$Time_lme == unique(NIH_lme8$Time_lme)[a]]), .025)
+  LDHrate_95CIup_overday_NIH_lme8[a] <- quantile(log10(NIH_lme8$LDH_lme[NIH_lme8$Time_lme == unique(NIH_lme8$Time_lme)[a]]), .975)
+}
+
+contest1D(lmefit_biphase_NIH_lme8, c(1,0,0), confint=TRUE)
+contest1D(lmefit_biphase_NIH_lme8, c(0,1,0), confint=TRUE)
+contest1D(lmefit_biphase_NIH_lme8, c(0,0,1), confint=TRUE)
+```
+
+```{r}
+library(merTools)
+#Prediction Intervals (95%)
+set.seed(8111)
+LDH_PI <- predictInterval(merMod = lmefit_biphase_NIH_lme8, newdata = data.frame(Time_lme = 0:8, individual_lme = 1:9), level = 0.95, n.sims = 1000, stat = "median")
+```
+
+```{r}
+pdf(file = "pldh_decay.pdf", width = 5, height = 6)
+
+#LDH Decay Plot
+ggplot() + xlab("Days Posttreatment") + geom_ribbon(data = LDH_PI, aes(ymin = lwr, ymax = upr, x = c(seq(0,8,1))), fill = "deepskyblue", alpha = 0.2) + ylab("pLDH (pg/ml)") + geom_point(aes(x = days, y = lmepred_biphase_NIH_lme8_pop), size = 2, col = "black") + geom_point(aes(x = unique(NIH_lme8$Time_lme), LDHrate_median_overday_NIH_lme8), size = 1, col = "black") + geom_segment(aes(x = unique(NIH_lme8$Time_lme) + .2, y = LDHrate_95CIlw_overday_NIH_lme8,
+         xend = unique(NIH_lme8$Time_lme) - 0.2, yend = LDHrate_95CIlw_overday_NIH_lme8), col = "deepskyblue3") + geom_segment(aes(x = unique(NIH_lme8$Time_lme)+.2, y = LDHrate_95CIup_overday_NIH_lme8,
+         xend = unique(NIH_lme8$Time_lme)-.2, yend = LDHrate_95CIup_overday_NIH_lme8), col = "deepskyblue3") + geom_segment(aes(x = unique(NIH_lme8$Time_lme), y = LDHrate_95CIlw_overday_NIH_lme8,
+         xend = unique(NIH_lme8$Time_lme), yend = LDHrate_95CIup_overday_NIH_lme8), col = "deepskyblue3") + theme_light(base_size = 15) + geom_line(aes(x = days, y = lmepred_biphase_NIH_lme8_pop), col = "black") + scale_y_continuous(breaks = c(seq(0,7)), labels = c(1, 10, 100, "1,000", "10,000", 10^5, 10^6, 10^7), limits = c(-.5,7.75)) + scale_x_continuous(breaks = c(seq(0,8,1)), limits = c(-0.5, 8.5), expand = c(0,0)) + geom_line(aes(x = seq(-.5,9), y = log10(14.41)), col = "gray", lty = 2)
+
+dev.off()
+```
+
+```{r}
+#ANOVA to compare monophasic and biphasic models
+anova(lmefit_biphase_NIH_lme8, lmefit_NIH_lme8, test = "Chisq")
+summary(lmefit_biphase_NIH_lme8)
+```
+
+
+
+

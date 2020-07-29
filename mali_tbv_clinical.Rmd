@@ -1,0 +1,294 @@
+---
+title: "NIH - Mali TBV Trial Clinical Analysis"
+output: html_notebook
+---
+
+Analysis of the Mali - TBV Trial Clinical Dataset with information on anti-malarial drug treatment of study participants.
+Emily Reichert (PATH), July 2019
+
+```{r}
+#load necessary libraries
+library(readr)
+library(EnvStats)
+library(binom)
+library(dplyr)
+library(ggplot2)
+library(pROC)
+library(cutpointr)
+library(reportROC)
+
+#import new clinical dataset, which contains antimalarial drug treatment variables
+NIH_clinical <- read_csv("NIH_clinical.csv")
+```
+
+```{r}
+#Set LDH, HRP2 antigen values beyond LOQ to lower LOQ/2 and upper LOQ*2
+NIH_clinical$HRP2_pg_ml[NIH_clinical$HRP2_pg_ml == '< 1.07'] <- 1.07/2
+NIH_clinical$LDH_Pan_pg_ml[NIH_clinical$LDH_Pan_pg_ml == '< 14.41'] <- 14.41/2 
+NIH_clinical$HRP2_pg_ml[NIH_clinical$HRP2_pg_ml == '> 16500.00'] <- 16500.00*2
+NIH_clinical$LDH_Pan_pg_ml[NIH_clinical$LDH_Pan_pg_ml == '> 525700.00'] <- 525700.00*2
+NIH_clinical$HRP2_pg_ml<- as.numeric(NIH_clinical$HRP2_pg_ml)
+NIH_clinical$LDH_Pan_pg_ml<- as.numeric(NIH_clinical$LDH_Pan_pg_ml)
+
+#make binary 0/1 uRDT variable
+NIH_clinical$uRDT_overall[NIH_clinical$uRDT_overall=='+'] <- 1
+NIH_clinical$uRDT_overall[NIH_clinical$uRDT_overall=='-'] <- 0
+NIH_clinical$uRDT_overall <- as.integer(NIH_clinical$uRDT_overall)
+
+#Make binary variable for HRP2, Pan LDH, and Pv LDH positivity
+NIH_clinical <- NIH_clinical %>%
+  mutate(HRP2_pg_ml_pos = as.numeric(HRP2_pg_ml_pos == "positive")) %>%
+  mutate(LDH_Pan_pg_ml_pos = as.numeric(LDH_Pan_pg_ml_pos == "positive")) %>%
+  mutate(LDH_Pv_pg_ml_pos = as.numeric(LDH_Pv_pg_ml_pos == "positive"))
+```
+
+```{r}
+#Clean up Microscopy data
+#Replace missing values with 0 for microscopy results
+#Make binary +/- variable for micro result
+
+#Convert from per 1000 WBC's to parasites/uL, using CDC conversion of 8000 WBC's per uL
+NIH_clinical <- NIH_clinical %>%
+  mutate_at(vars(`P. falciparum`, 
+                 `Avg. Pf Gam`, 
+                 `P. malariae`, 
+                 `P. ovale`), ~replace_na(., 0)) %>%
+  mutate(pf_parasites = `P. falciparum` + `Avg. Pf Gam`) %>%
+  mutate(micro_result = ifelse(pf_parasites != 0, '+', '-')) %>%
+  mutate(micro_result_num = as.numeric(micro_result == '+')) %>%
+  mutate(parasites_uL = pf_parasites*8)
+```
+
+```{r}
+#Filter out non-Pf infections from further analyses
+NIH_clinical <- NIH_clinical %>%
+  mutate(pm_only = (`P. malariae` != 0 & pf_parasites == 0)) %>%
+  mutate(po_only = (`P. ovale` != 0 & pf_parasites == 0)) %>%
+  filter(pm_only == FALSE & po_only == FALSE)
+```
+
+```{r}
+#create variable for HRP2/pLDH ratio
+NIH_clinical <- NIH_clinical %>%
+  mutate(HRP2toLDH = HRP2_pg_ml/LDH_Pan_pg_ml)
+
+temp = strsplit(NIH_clinical$`Volunteer ID`, "-")
+
+NIH_clinical <- NIH_clinical %>%
+  mutate(`Volunteer ID` = as.numeric(unlist(lapply(temp, FUN = "[[", 3)))) %>%
+  #make bleed day numeric
+  mutate(Day = as.numeric(unlist(lapply(strsplit(NIH_clinical$`Bleed Day`, "D"),
+                                        FUN="[[",2)))) %>%
+  #calculate time since anti-malarial drug treatment
+  mutate(time_from_drug = Day - drug_date) %>%
+  mutate(week = time_from_drug/7) %>%
+  #make binary recent treatment variable for those treated in past 3 and 4 weeks
+  #without recurrent Pf parasitemia
+  mutate(recent_treatment4 = ifelse((week > 0 & week <= 4 & parasites_uL == 0), 1, 0)) %>%
+  mutate(recent_treatment3 = ifelse((week > 0 & week <= 3 & parasites_uL == 0), 1, 0))
+
+for (i in 1:nrow(NIH_clinical)) {
+  if(NIH_clinical$parasites_uL[i] != 0 & is.na(NIH_clinical$recent_treatment3[i])) {
+    NIH_clinical$recent_treatment3[i] <- 0
+  }
+}
+
+NIH_clinical$recent_treatment3[NIH_clinical$parasites_uL == 0 & NIH_clinical$recent_treatment3 != 1] = NA
+```
+
+```{r}
+#Test if 3 or 4 weeks is better to define "recent treatment"
+t.test(log10(HRP2toLDH) ~ recent_treatment4, data = NIH_clinical)
+
+cp <- cutpointr(NIH_clinical, HRP2toLDH, recent_treatment4, na.rm = TRUE, method = maximize_metric, metric = sum_sens_spec)
+
+t.test(log10(HRP2toLDH) ~ recent_treatment4, data = NIH_clinical)
+cp <- cutpointr(NIH_clinical, HRP2toLDH, recent_treatment3, na.rm = TRUE, method = maximize_metric, metric = sum_sens_spec)
+```
+
+No significant differences were found in the utility of using HRP2/pLDH ratios to predict recent treatment for those treated in the past 3 or 4 weeks. We will move forward with recent anti-malarial treatment defined as 3 wks (<21 days) to be more conservative in who we consider 'recently treated'.
+
+```{r}
+sub <- NIH_clinical %>%
+  select(HRP2toLDH, HRP2_pg_ml, recent_treatment3)
+
+#HRP2/LDH ratio threshold for > 100 pg/ml HRP2
+over100 = subset(sub, HRP2_pg_ml > 100)
+cp1 <- cutpointr(over100, HRP2toLDH, recent_treatment3, na.rm = TRUE, 
+                method = maximize_metric, metric = youden)
+cp1
+
+#HRP2/LDH ratio threshold for < 100 pg/ml HRP2
+under100 = subset(sub, HRP2_pg_ml <= 100)
+cp2 <- cutpointr(under100, HRP2toLDH, recent_treatment3, na.rm = TRUE, 
+                method = maximize_metric, metric = youden)
+cp2
+
+sub$treatment_predicted[sub$HRP2_pg_ml > 100 & sub$HRP2toLDH > 8.99] <- 1
+sub$treatment_predicted[sub$HRP2_pg_ml > 100 & sub$HRP2toLDH < 8.99] <- 0
+sub$treatment_predicted[sub$HRP2_pg_ml < 100 & sub$HRP2toLDH > 0.49] <- 1
+sub$treatment_predicted[sub$HRP2_pg_ml < 100 & sub$HRP2toLDH < 0.49] <- 0
+
+reportROC(gold=sub$recent_treatment3,
+          predictor=as.numeric(sub$treatment_predicted),
+          important="se",plot=TRUE)
+```
+
+```{r}
+#Recently treated individuals by uRDT and microscopy result
+NIH_clinical %>%
+  filter(recent_treatment3 == 1) %>%
+  group_by(uRDT_overall, micro_result) %>%
+  summarise(n())
+```
+
+Scatterplot of LDH vs. HRP2 by Microscopy, uRDT combined result (Figure 3)
+crosses = recent antimalarial treatment (past 21 days)
+outputs as PDF file
+
+```{r}
+scatterplot <- NIH %>%
+  dplyr::select(HRP2_pg_ml, LDH_Pan_pg_ml, uRDT_result, micro_result) %>%
+  mutate(groups = rep(NA, nrow(.)))
+
+#Create dummy variable for combined uRDT, microscopy result
+scatterplot$groups[scatterplot$uRDT_result == 1 & scatterplot$micro_result == '+'] <- "uRDT and Microscopy Positive"
+scatterplot$groups[scatterplot$uRDT_result == 1 & scatterplot$micro_result == '-'] <- "uRDT Positive, Microscopy Negative"
+scatterplot$groups[scatterplot$uRDT_result == 0 & scatterplot$micro_result == '+'] <- "Microscopy Positive, uRDT Negative"
+scatterplot$groups[scatterplot$uRDT_result == 0 & scatterplot$micro_result == '-'] <- "uRDT and Microscopy Negative"
+
+scatterplot <- scatterplot %>% drop_na()
+
+#create subset of only recently treated patients
+recent_treatment3 <- subset(NIH_clinical, recent_treatment3 == 1) %>%
+  dplyr::select(HRP2_pg_ml, LDH_Pan_pg_ml, uRDT_overall, micro_result) %>%
+  drop_na() %>%
+  mutate(HRP2toLDH = HRP2_pg_ml/LDH_Pan_pg_ml)
+
+recent_treatment3$uRDT_overall <- NA
+recent_treatment3$uRDT_overall[recent_treatment3$uRDT_overall==1] <- '+'
+recent_treatment3$uRDT_overall[recent_treatment3$uRDT_overall==0] <- '-'
+
+#create dummy variable 'groups' combining uRDT and micro result
+recent_treatment3$groups[recent_treatment3$uRDT_overall == '+' & recent_treatment3$micro_result == '+'] <- "uRDT and Microscopy Positive"
+recent_treatment3$groups[recent_treatment3$uRDT_overall == '+' & recent_treatment3$micro_result == '-'] <- "uRDT Positive, Microscopy Negative"
+recent_treatment3$groups[recent_treatment3$uRDT_overall == '-' & recent_treatment3$micro_result == '+'] <- "Microscopy Positive, uRDT Negative"
+recent_treatment3$groups[recent_treatment3$uRDT_overall == '-' & recent_treatment3$micro_result == '-'] <- "uRDT and Microscopy Negative"
+
+pdf(file = "Mali_legend.pdf", width = 7.1, height = 5.9)
+
+p <- ggplot() + geom_point(data = scatterplot, aes(x = log10(HRP2_pg_ml), y = log10(LDH_Pan_pg_ml), colour = groups), size = 4) + xlab("HRP2 (pg/mL)") + ylab("pLDH (pg/mL)")
+
+p + scale_x_continuous(breaks=c(0,1,2,3,4), labels=c('<1.07', 10^1, 10^2, "1,000", "10,000")) + scale_y_continuous(breaks=c(1.16,2,3,4,5), labels=c('<14.41', 10^2, "1,000", "10,000", 10^5)) + scale_color_manual(values = c("darkred", "indianred2", "deepskyblue4", "cyan3")) + geom_point(data = recent_treatment3, aes(x = log10(HRP2_pg_ml), y = log10(LDH_Pan_pg_ml)), color = "black", shape = 3, size = 4) + theme_gray() + labs(colour = 'uRDT and Microscopy Result') + geom_vline(xintercept = log10(80), linetype="dotted", color = "black", size=1) + geom_hline(yintercept = log10(10000), linetype="dotted", color = "black", size=1) + theme_light() + theme(legend.position = "none")
+
+dev.off()
+```
+
+Scatterplot of HRP2/pLDH Ratios vs. HRP2 by Microscopy, uRDT combined result
+crosses = recent antimalarial treatment (past 21 days)
+outputs as PDF file
+
+```{r}
+scatterplot <- scatterplot %>%
+  mutate(HRP2toLDH = HRP2_pg_ml/LDH_Pan_pg_ml)
+
+pdf(file = "HRP2toLDHratio.pdf", width = 6.6, height = 5.9)
+
+p <- ggplot() + geom_point(data = scatterplot, aes(x = log10(HRP2_pg_ml), y = log10(HRP2toLDH), col = groups), size = 5) + xlab("HRP2 (pg/ml)") + ylab("HPR2/pLDH Ratio")
+
+p + scale_x_continuous(breaks=c(0,1,2,3,4), labels=c('<1.07', 10^1, 10^2, 10^3, 10^4)) + theme_light() + theme(legend.position = "none") + scale_color_manual(values = c("darkred", "indianred2", "deepskyblue4", "cyan3")) + geom_point(data = recent_treatment3, aes(x = log10(HRP2_pg_ml), y = log10(HRP2toLDH)), color = "black", shape = 3, size = 4) + scale_y_continuous(breaks=c(-2,0,2,4), labels=c(10^seq(-2,4,2))) + geom_hline(yintercept = log10(8.99), linetype = "dotted", color = "black") + geom_hline(yintercept = log10(0.49), linetype = "dotted", color = "black") + geom_vline(xintercept = 2)
+
+dev.off()
+```
+
+Boxplot of HRP2:pLDH ratios for individuals within 4 weeks pretreatment to 7 weeks posttreatment
+
+```{r}
+treated <- NIH_clinical %>% 
+  filter(time_from_drug >= -28 & time_from_drug <= 49) %>% 
+  filter(!is.na(HRP2toLDH)) %>% 
+  mutate(recurrence = ifelse((time_from_drug > 1 & parasites_uL != 0), 1,0)) %>%
+  filter(recurrence != 1)
+
+boxplot <- treated %>% select(week, HRP2toLDH, `Volunteer ID`)
+
+#create dummy variable for weeks pre- or posttreatment
+boxplot$week_group[boxplot$week == 0] <- 0
+boxplot$week_group[boxplot$week >0 & boxplot$week <= 1] = 1
+boxplot$week_group[boxplot$week >1 & boxplot$week <= 2] = 2
+boxplot$week_group[boxplot$week >2 & boxplot$week <= 3] = 3
+boxplot$week_group[boxplot$week >3 & boxplot$week <= 4] = 4
+boxplot$week_group[boxplot$week >4 & boxplot$week <= 5] = 5
+boxplot$week_group[boxplot$week >5 & boxplot$week <= 6] = 6
+boxplot$week_group[boxplot$week >6 & boxplot$week <= 7] <- 7
+
+boxplot$week_group[boxplot$week <0 & boxplot$week >= -1] = -1
+boxplot$week_group[boxplot$week < -1 & boxplot$week >= -2] = -2
+boxplot$week_group[boxplot$week < -2 & boxplot$week >= -3] = -3
+boxplot$week_group[boxplot$week < -3 & boxplot$week >= -4] = -4
+
+boxplot <- boxplot %>% filter(!is.na(week_group))
+
+pdf(file = "HRP2_barplot.pdf", width = 7.1, height = 5.9)
+
+p <- ggplot(boxplot, aes(x=as.factor(week_group), y=log10(HRP2toLDH))) + 
+    geom_boxplot(fill="orange", col = "red", alpha=0.2, outlier.colour="red",
+        outlier.fill="red",outlier.size=2) + xlab("Week from Treatment") + ylab("HRP2/pLDH") 
+
+p + scale_y_continuous(breaks=c(-2:4), labels=c(10^-2, 10^-1, 10^0, 10, 10^2, '1,000', '10,000')) + geom_hline(yintercept = 0, linetype = "dotted", size = 1.2)
+dev.off()
+```
+
+Density Plot of HRP2/LDH ratios for Recently treated vs not, by HRP2 concentration
+```{r}
+#for samples > 100 pg/ml HRP2
+sub <- NIH_clinical %>%
+  select(HRP2_pg_ml, recent_treatment3, HRP2toLDH)
+
+sub$group[sub$HRP2_pg_ml > 100 & sub$recent_treatment3 == 1] <- "Clearing"
+sub$group[sub$HRP2_pg_ml > 100 & sub$recent_treatment3 == 0] <- "Active"
+sub <- sub %>% drop_na()
+
+p <- ggplot(data = sub,
+            mapping = aes(x = log10(HRP2toLDH), y = ..density.., fill = factor(group), color = factor(group)))
+over100 <- p + geom_density(alpha = 0.5) + theme_classic() + scale_x_continuous(limits = c(-5,5), breaks=c(seq(-2,2)), labels=c(10^seq(-2,2))) + xlab("HRP2/pLDH Ratio") + ylab("Kernel density") + labs(fill = "Infection Status", col = "Infection Status") + geom_vline(xintercept = log10(8.99), col = "black") + annotate("text", x = 3.1, y = .5, label = "Threshold 8.99") + ggtitle("C. HRP2 > 100 pg/ml") + annotate("text", x = 3.1, y = .46, label = "AUC 0.92") + scale_fill_manual(values = c("coral", "slateblue2")) + scale_color_manual(values = c("coral", "slateblue2"))+ theme(legend.position = c(.19, .8))
+over100 
+
+#for samples < 100 pg/ml HRP2
+
+sub <-  NIH_clinical %>%
+  select(HRP2_pg_ml, recent_treatment3, HRP2toLDH)
+
+sub$group[sub$HRP2_pg_ml < 100 & sub$recent_treatment3 == 1] <- "Clearing"
+sub$group[sub$HRP2_pg_ml < 100 & sub$recent_treatment3 == 0] <- "Active"
+sub <- sub %>% drop_na()
+
+under100 <- ggplot() + geom_density(data = sub, aes(x = log10(HRP2toLDH), y = ..density.., fill = factor(group), color = factor(group)), alpha = 0.5)+ theme_classic() + scale_x_continuous(limits = c(-5,5), breaks=c(seq(-2,2)), labels=c(10^seq(-2,2))) + xlab("HRP2/pLDH Ratio") + ylab("Kernel density") + geom_vline(xintercept = log10(0.49), col = "black") + annotate("text", x = 2.3, y = .4, label = "Threshold 0.49") + ggtitle("D. HRP2 < 100 pg/ml") + annotate("text", x = 2.3, y = .36, label = "AUC 0.76") + theme(legend.position = c(.19, .8)) + labs(fill = "Infection Status", col = "Infection Status") + scale_fill_manual(values = c("coral", "slateblue2")) + scale_color_manual(values = c("coral", "slateblue2"))
+under100
+
+#export plot
+pdf(file = "ratio_densities.pdf", width = 9.3, height = 3.9)
+grid.arrange(over100, under100,nrow = 1)
+dev.off()
+```
+
+
+HRP2toLDH Ratios Pre- versus Post- Treatment
+
+```{r}
+treated <- NIH_clinical %>% filter(time_from_drug >= -28 & time_from_drug <= 49) %>% filter(!is.na(HRP2toLDH)) %>% mutate(recurrence = ifelse((time_from_drug > 1 & parasites_uL != 0), 1,0)) %>% filter(recurrence != 1)
+#no. of samples
+nrow(treated)
+#no. of unique individuals
+length(unique(treated$`Volunteer ID`))
+
+#hrp2/pLDH ratio summary statistics pretreatment
+pretreatment <- treated %>% filter(time_from_drug <= 0)
+summary(pretreatment$HRP2toLDH)
+
+#hrp2/pLDH ratio summary statistics posttreatment
+posttreatment <- treated %>% filter(time_from_drug >= 0)
+summary(posttreatment$HRP2toLDH)
+```
+
+

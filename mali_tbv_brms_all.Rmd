@@ -1,0 +1,206 @@
+---
+title: "NIH - Mali TBV Bayesian Models"
+output: html_notebook
+---
+
+Emily Reichert, July 2019
+This Rmd file takes the cleaned study datasets from Mali, Uganda, and Myanmar and generates Bayesian logistic regression models for probability of uRDT detection based on HRP2 (pg/ml) concentrations. (i.e. generates Figure 2)
+
+Part I. Fit Bayesian Logistic Probability of Detection Curves to Mali, Uganda, Myanmar
+Note: First run 'mali_tbv_uganda_myanmar.R' and 'mali_tbv_clinical.Rmd' scripts to clean datasets 
+
+```{r}
+#load necessary libraries
+library(dplyr)
+library(binom)
+library(foreign)
+library(readstata13)
+library(RColorBrewer)
+library(brms)
+```
+
+A. Fit brms model to BIOME_1_ Uganda dataset (cleaned)
+```{r}
+#pull out HRP2 and uRDT variables
+z3 <- BIOME1_uganda_1_ %>%
+  select(HRP2_pg_ml, uRDT_result = HS_RDT_Result)
+
+#fit model
+library(rstan)
+mod = brms::brm(
+  uRDT_result ~ log10(HRP2_pg_ml),
+  data = z3,
+  family = "bernoulli",
+  prior = prior('normal(0,3)'),
+  iter = 1000,
+  chains = 4,
+  cores = 4
+)
+```
+
+```{r}
+hrp2.seq = seq(-1,5, by = 0.1)
+
+newdata = expand.grid(HRP2_pg_ml = 10^hrp2.seq)
+
+fit = fitted(
+  mod,
+  newdata = newdata,
+  summary = TRUE
+) * 100
+
+colnames(fit) = c('fit','se','lwr','upr')
+df1 = cbind(newdata,fit)
+```
+
+B. Fit brms model to SMRU Myanmar data (Cleaned)
+```{r}
+z5 = SMRU_Myanmar %>%
+  select(HSRDT_num, HRP2_pg_ml)
+
+mod = brms::brm(
+  HSRDT_num ~ log10(HRP2_pg_ml),
+  data = z5,
+  family = "bernoulli",
+  prior = prior('normal(0,3)'),
+  iter = 1000,
+  chains = 4,
+  cores = 4
+)
+```
+
+```{r}
+hrp2.seq = seq(-1,5, by = 0.1)
+
+newdata = expand.grid(HRP2_pg_ml = 10^hrp2.seq)
+
+fit = fitted(
+  mod,
+  newdata = newdata,
+  summary = TRUE
+) * 100
+
+colnames(fit) = c('fit','se','lwr','upr')
+df3 = cbind(newdata,fit)
+```
+
+C. Fit brms model to Mali uRDT, NIH dataset (cleaned)
+```{r}
+z4 <- NIH %>%
+  select(uRDT_result, HRP2_pg_ml)
+
+mod = brms::brm(
+  uRDT_result ~ log10(HRP2_pg_ml),
+  data = z4,
+  family = "bernoulli",
+  prior = prior('normal(0,3)'),
+  iter = 1000,
+  chains = 4,
+  cores = 4
+)
+```
+
+```{r}
+hrp2.seq = seq(-1,5, by = 0.1)
+newdata = expand.grid(HRP2_pg_ml = 10^hrp2.seq)
+
+fit = fitted(
+  mod,
+  newdata = newdata,
+  summary = TRUE
+) * 100
+
+colnames(fit) = c('fit','se','lwr','upr')
+df = cbind(newdata,fit)
+```
+
+D. Fit brms model to Mali co-RDT
+```{r}
+z1 = subset(NIH, !is.na(RDT))
+z1 <- z1 %>%
+  select(RDT, HRP2_pg_ml)
+
+mod = brms::brm(
+  RDT ~ log10(HRP2_pg_ml),
+  data = z1,
+  family = "bernoulli",
+  prior = prior('normal(0,3)'),
+  iter = 1000,
+  chains = 4,
+  cores = 4
+)
+```
+
+```{r}
+hrp2.seq = seq(-1,5, by = 0.1)
+
+newdata = expand.grid(HRP2_pg_ml = 10^hrp2.seq)
+
+fit = fitted(
+  mod,
+  newdata = newdata,
+  summary = TRUE
+) * 100
+
+colnames(fit) = c('fit','se','lwr','upr')
+df7 = cbind(newdata,fit)
+```
+
+
+```{r}
+#make composite figure showing probability of detection curves for all study cohorts
+pdf(file = "Mali_brms.pdf", width = 6.8, height = 5.9)
+
+p <- plot(log10(df$HRP2_pg_ml), df$fit, col = "deeppink", lwd=2,type="l", xaxt = "n", yaxt = "n", ylab = "Probability of Detection by RDT (%)", xlab = expression(paste("HRP2 pg/ml")), xlim = c(-1,5), ylim = c(0,100))
+
+#Add curve for Mali uRDT
+abline(v = log10(c(1,10,10^2,10^3,10^4)), col = "darkgrey", lty = 5)
+abline(h = seq(0,100, by=20), col="grey", lty=3)
+polygon(c(log10(df$HRP2_pg_ml), rev(log10(df$HRP2_pg_ml))), c(df$lwr, rev(df$upr)), col=adjustcolor("deeppink", 0.3), border = NA)
+
+#Add curve for Uganda uRDT
+lines(log10(df1$HRP2_pg_ml), df1$fit, col = "deepskyblue", lwd=2,type="l", xaxt = "n", yaxt = "n", xlim = c(-1,6), ylim = c(0,100))
+polygon(c(log10(df1$HRP2_pg_ml), rev(log10(df1$HRP2_pg_ml))), c(df1$lwr, rev(df1$upr)), col=adjustcolor("deepskyblue", 0.3), border = NA)
+
+#Add curve for Myanmar uRDT
+lines(log10(df3$HRP2_pg_ml), df3$fit, col = "darkorchid1", lwd=2,type="l", xaxt = "n", yaxt = "n", xlim = c(-1,6), ylim = c(0,100))
+polygon(c(log10(df3$HRP2_pg_ml), rev(log10(df3$HRP2_pg_ml))), c(df3$lwr, rev(df3$upr)), col=adjustcolor("darkorchid1", 0.3), border = NA)
+
+#Add curve for Mali coRDT
+lines(log10(df7$HRP2_pg_ml), df7$fit, col = "orange", lwd=2,type="l", xaxt = "n", yaxt = "n", xlim = c(-1,6), ylim = c(0,100))
+polygon(c(log10(df7$HRP2_pg_ml), rev(log10(df7$HRP2_pg_ml))), c(df7$lwr, rev(df7$upr)), col=adjustcolor("orange", 0.3), border = NA)
+
+legend(-1,100,legend=c("Mali uRDT","Uganda uRDT","Myanmar uRDT", "Mali co-RDT"), col=c("deeppink","deepskyblue","darkorchid1", "orange"), lty = c(1,1,1), ncol=1)
+
+axis(1,log10(c(10^0, 10^1, 10^2, 10^3, 10^4)), c("1", "10", "100", "1,000", "10,000"))
+axis(2, seq(0,100, by=20), las = 1)
+
+dev.off()
+```
+
+
+PART II. HRP2 distributions density plot
+
+Arrange data into format for density plot
+```{r}
+a <- NIH[,14]
+a$Population <- "Mali (n = 622, high transmission)"
+b <- BIOME1_uganda_1_[,11]
+b$Population <- "Uganda (n = 607, high transmission)"
+c <- smru_myanmar[,26]
+c$Population <- "Myanmar (n = 1845, low transmission)"
+
+compiled_hrp2 = rbind(a,b,c)
+```
+
+Create plot comparing HRP2 distributions of three study populations
+```{r}
+compiled_hrp2$HRP2_pg_ml <- as.numeric(compiled_hrp2$HRP2_pg_ml)
+
+ggplot(compiled_hrp2,aes(x=log10(HRP2_pg_ml),fill=Population, color = Population)) +
+  geom_density(aes(y = ..scaled..), alpha = 0.3)+
+  facet_wrap(~Population,nrow=3) +
+  labs(y="Scaled density")+
+  labs(x="HRP2 (pg/ml)") + scale_x_continuous(breaks = c(0,1,2,3,4,5), labels = c(10^seq(0,5))) + scale_fill_manual(values = c("deeppink", "darkorchid1", "deepskyblue")) + scale_color_manual(values = c("deeppink", "darkorchid1", "deepskyblue")) + theme(legend.position = "none", text = element_text(size = 14))
+```
+
